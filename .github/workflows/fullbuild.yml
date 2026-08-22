@@ -1,0 +1,91 @@
+# Phase 2: real project build (pinned 98fd703) with re-applied Keychain
+# sources and SHELL-frame? framework link patch. This mirrors the project's
+# macos job minus the artifact/release noise, and prints the actual link
+# line via CMAKE_VERBOSE_MAKEFILE.
+name: fullbuild
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch project at pinned commit
+        run: |
+          rm -rf /tmp/iwan && mkdir -p /tmp/iwan
+          git -C /tmp/iwan init -q
+          git -C /tmp/iwan remote add origin https://github.com/Jerrid-Huang/ustc-iwan-c.git
+          git -C /tmp/iwan fetch -q --depth 1 origin 98fd703
+          git -C /tmp/iwan checkout -q FETCH_HEAD
+          git -C /tmp/iwan fetch -q --depth 1 origin 3789e17 || true
+          git -C /tmp/iwan apply "$(pwd)/patches/full.patch"
+          echo "head: $(git -C /tmp/iwan rev-parse --short HEAD)"
+          grep -n 'SHELL:-framework' /tmp/iwan/CMakeLists.txt
+          grep -c 'SecItemAdd' /tmp/iwan/src/oidc/oidc_pwsecret.c
+
+      - name: Build OpenSSL from source (${{ matrix.arch }})
+        run: |
+          VER="$(curl -s --retry 3 "https://api.github.com/repos/openssl/openssl/tags?per_page=100" \
+            | jq -r 'if type == "array" then (.[].name | select(test("^openssl-3\\.5\\."))) else empty end' \
+            | head -1)"
+          [ -n "$VER" ] || VER="openssl-3.5.1"
+          echo "building OpenSSL $VER for ${{ matrix.arch }}"
+          curl -sfL --retry 3 --max-time 400 \
+            "https://github.com/openssl/openssl/archive/refs/tags/${VER}.tar.gz" \
+            -o /tmp/ossl.tgz
+          tar xzf /tmp/ossl.tgz -C /tmp
+          cd /tmp/openssl-openssl-*
+          CFLAGS="-mmacosx-version-min=11.0" \
+            ./Configure darwin64-${{ matrix.arch }}-cc no-shared \
+            --prefix=/opt/ossl-${{ matrix.arch }}
+          make -j"$(sysctl -n hw.ncpu)" build_libs
+          sudo make install_sw
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DOPENSSL_ROOT_DIR=/opt/ossl-${{ matrix.arch }} \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DCMAKE_VERBOSE_MAKEFILE=ON \
+            -DIWAN_WERROR=ON
+
+      - name: Build (${{ matrix.arch }})
+        run: |
+          set -o pipefail
+          cmake --build build -j"$(sysctl -n hw.ncpu)" 2>&1 | tee build.log
+          if grep -Ei 'error:|warning:' build.log; then
+            echo "::error::build emitted errors or warnings"
+            exit 1
+          fi
+
+      - name: Inspect link line (${{ matrix.arch }})
+        run: |
+          grep -c -- '-framework' build.log
+          grep -oE 'clang.*-o bin/iwan-client-oidc' build.log | tail -1 | head -c 20000
+          echo
+          grep -oE ' -framework [A-Za-z]+' build.log | sort | uniq -c
+          # also the iwan-client (no OIDC) should NOT carry frameworks
+          grep -oE 'clang.*-o bin/iwan-client[^-]' build.log | tail -1 | grep -c Security || true
+
+      - name: Verify binaries (${{ matrix.arch }})
+        run: |
+          file bin/iwan-client bin/iwan-client-oidc
+          echo "--- otool -L iwan-client-oidc:"
+          otool -L bin/iwan-client-oidc | grep -Ei 'Security|CoreFoundation|homebrew|/usr/local'
+          echo "--- undef check:"
+          nm -u bin/iwan-client-oidc | grep -iE 'CFData|SecItem' || echo "no undef CF/Sec symbols"
+          echo "--- codesign:"
+          codesign -s - -f bin/iwan-client bin/iwan-client-oidc
+          codesign -dv bin/iwan-client-oidc 2>&1 | head -3
+
+      - name: Smoke test
+        run: |
+          ./bin/iwan-client --help >/dev/null
+          ./bin/iwan-client-oidc --help >/dev/null
