@@ -50,6 +50,7 @@ jobs:
 
       - name: Configure
         run: |
+          cd /tmp/iwan
           cmake -B build \
             -DOPENSSL_ROOT_DIR=/opt/ossl-${{ matrix.arch }} \
             -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
@@ -59,6 +60,7 @@ jobs:
 
       - name: Build (${{ matrix.arch }})
         run: |
+          cd /tmp/iwan
           set -o pipefail
           cmake --build build -j"$(sysctl -n hw.ncpu)" 2>&1 | tee build.log
           if grep -Ei 'error:|warning:' build.log; then
@@ -68,6 +70,7 @@ jobs:
 
       - name: Inspect link line (${{ matrix.arch }})
         run: |
+          cd /tmp/iwan
           grep -c -- '-framework' build.log
           grep -oE 'clang.*-o bin/iwan-client-oidc' build.log | tail -1 | head -c 20000
           echo
@@ -77,6 +80,7 @@ jobs:
 
       - name: Verify binaries (${{ matrix.arch }})
         run: |
+          cd /tmp/iwan
           file bin/iwan-client bin/iwan-client-oidc
           echo "--- otool -L iwan-client-oidc:"
           otool -L bin/iwan-client-oidc | grep -Ei 'Security|CoreFoundation|homebrew|/usr/local'
@@ -88,5 +92,6 @@ jobs:
 
       - name: Smoke test
         run: |
+          cd /tmp/iwan
           ./bin/iwan-client --help >/dev/null
           ./bin/iwan-client-oidc --help >/dev/null
