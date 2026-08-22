@@ -1,0 +1,59 @@
+# Probe matrix: which linking idiom actually delivers -framework Security
+# (and CoreFoundation) to ld64 with all symbols resolved? Each leg is a
+# seconds-scale minimal project; all legs run in parallel and none is
+# allowed to abort the matrix. Read each leg's log for its real link
+# line (CMAKE_VERBOSE_MAKEFILE=ON) and exit codes.
+name: probe
+
+on: [push, workflow_dispatch]
+
+jobs:
+  probe:
+    runs-on: macos-14
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        dir:
+          - rawcc-post
+          - rawcc-wlcomma
+          - rawcc-fwfirst
+          - cm-shell
+          - cm-linkflags
+          - cm-libraries
+          - cm-findlib
+          - cm-tbd
+          - cm-native
+          - cm-worldflags
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: runner info
+        run: |
+          uname -m
+          sw_vers
+          xcode-select -p
+          echo "SDK=$(xcrun --show-sdk-path)"
+          clang --version | head -1
+          cmake --version | head -1
+          ls "$(xcrun --show-sdk-path)/System/Library/Frameworks" | grep -iE '^(Security|CoreFoundation|CFNetwork)\.'
+
+      - name: "leg: ${{ matrix.dir }}"
+        run: |
+          echo "=== leg: ${{ matrix.dir }}"
+          set +e
+          if [ -f "probe/${{ matrix.dir }}/build.sh" ]; then
+            bash probe/${{ matrix.dir }}/build.sh
+            echo "leg-exit=$?"
+          else
+            cmake -B /tmp/b -S "probe/${{ matrix.dir }}" -DCMAKE_VERBOSE_MAKEFILE=ON
+            echo "configure-exit=$?"
+            cmake --build /tmp/b -j2
+            echo "build-exit=$?"
+            if [ -x /tmp/b/probe ]; then
+              /tmp/b/probe; echo "run-exit=$?"
+              otool -L /tmp/b/probe
+              nm -u /tmp/b/probe | grep -iE 'CFData|SecItem|CFDictionary' || echo "no undef CF/Sec symbols"
+            fi
+          fi
+          echo "=== leg done: ${{ matrix.dir }}"

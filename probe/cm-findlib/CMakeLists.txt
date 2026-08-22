@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.16)
+project(probe C)
+add_executable(probe ../probe.c)
+# find_library with explicit SDK path (mirrors 906ec17)
+execute_process(COMMAND xcrun --show-sdk-path
+                OUTPUT_VARIABLE SDK OUTPUT_STRIP_TRAILING_WHITESPACE)
+message(STATUS "SDK=${SDK}")
+find_library(SEC_LIB Security PATHS "${SDK}/System/Library/Frameworks" NO_DEFAULT_PATH REQUIRED)
+find_library(CF_LIB  CoreFoundation PATHS "${SDK}/System/Library/Frameworks" NO_DEFAULT_PATH REQUIRED)
+message(STATUS "SEC_LIB=${SEC_LIB} CF_LIB=${CF_LIB}")
+target_link_libraries(probe PRIVATE "${SEC_LIB}" "${CF_LIB}")

@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+project(probe C)
+add_executable(probe ../probe.c)
+# quoted pair as PRIVATE link items (mirrors 52150c9's "two link items")
+target_link_libraries(probe PRIVATE "-framework Security" "-framework CoreFoundation")
