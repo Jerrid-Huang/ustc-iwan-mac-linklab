@@ -21,9 +21,10 @@ jobs:
           rm -rf /tmp/iwan && mkdir -p /tmp/iwan
           git -C /tmp/iwan init -q
           git -C /tmp/iwan remote add origin https://github.com/Jerrid-Huang/ustc-iwan-c.git
-          git -C /tmp/iwan fetch -q --depth 1 origin 98fd703
+          git -C /tmp/iwan fetch -q --depth 2 origin main
           git -C /tmp/iwan checkout -q FETCH_HEAD
-          git -C /tmp/iwan fetch -q --depth 1 origin 3789e17 || true
+          [ "$(git -C /tmp/iwan rev-parse HEAD)" = "98fd703baabff91e15121834642a1b9fc9a14c71" ] || {
+            echo "expected 98fd703, got $(git -C /tmp/iwan rev-parse HEAD)"; exit 1; }
           git -C /tmp/iwan apply "$(pwd)/patches/full.patch"
           echo "head: $(git -C /tmp/iwan rev-parse --short HEAD)"
           grep -n 'SHELL:-framework' /tmp/iwan/CMakeLists.txt
