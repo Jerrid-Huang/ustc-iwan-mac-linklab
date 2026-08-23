@@ -112,10 +112,21 @@ static void echo_cb(void *ud, uint8_t *p, size_t len, bool last)
         k[10] = (uint8_t)(cs >> 8);
         k[11] = (uint8_t)cs;
 
-        if (c->swap_fam)
-            write_with_fam(c, k, len, __builtin_bswap32((uint32_t)AF_INET));
-        else
+        if (c->swap_fam) {
+            /* TRUE native-order bytes on a little-endian Mac:
+             * {02 00 00 00}. (Note: bswap32(htonl(x)) is a byte-level
+             * no-op -- the first probe revision accidentally wrote the
+             * same network-order bytes in both rounds.) */
+            uint8_t fam_native[4] = { (uint8_t)AF_INET, 0, 0, 0 };
+            uint8_t nb[4 + 65536];
+            memcpy(nb, fam_native, 4);
+            memcpy(nb + 4, k, len);
+            ssize_t w = write(c->fd, nb, len + 4);
+            if (w < 0)
+                atomic_fetch_add(&c->wr_fail, 1);
+        } else {
             tun_write(c->fd, k, len);
+        }
         c->seen4++;
         return;
     }
