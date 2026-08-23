@@ -23,7 +23,7 @@ jobs:
           git -C /tmp/iwan remote add origin https://github.com/Jerrid-Huang/ustc-iwan-c.git
           git -C /tmp/iwan fetch -q --depth 2 origin main
           git -C /tmp/iwan checkout -q FETCH_HEAD
-          [ "$(git -C /tmp/iwan rev-parse HEAD)" = "66babaabf807c199b98c9e603e39ea722935a1c2" ] || {
+          [ "$(git -C /tmp/iwan rev-parse HEAD)" = "917f3084339b08037205018d3de3a641cdecad9d" ] || {
             echo "unexpected HEAD $(git -C /tmp/iwan rev-parse HEAD)"; exit 1; }
           echo "head: $(git -C /tmp/iwan rev-parse --short HEAD)"
           grep -n 'SHELL:-framework' /tmp/iwan/CMakeLists.txt
