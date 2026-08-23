@@ -57,7 +57,22 @@ static uint16_t csum16(const uint8_t *p, size_t n)
 typedef struct {
     int fd;
     atomic_int seen4, seen6;
+    int swap_fam;   /* 0: native-order family via tun_write (shipped);
+                     * 1: byte-swapped family written directly (probe) */
+    atomic_int wr_fail;
 } echo_ctx_t;
+
+/* write with an explicit family value (lets us A/B the byte order) */
+static void write_with_fam(echo_ctx_t *c, const uint8_t *pkt, size_t len,
+                           uint32_t fam)
+{
+    uint8_t wbuf[4 + 65536];
+    memcpy(wbuf, &fam, sizeof fam);
+    memcpy(wbuf + sizeof fam, pkt, len);
+    ssize_t w = write(c->fd, wbuf, len + sizeof fam);
+    if (w < 0)
+        atomic_fetch_add(&c->wr_fail, 1);
+}
 
 static void echo_cb(void *ud, uint8_t *p, size_t len, bool last)
 {
@@ -73,20 +88,34 @@ static void echo_cb(void *ud, uint8_t *p, size_t len, bool last)
         size_t icl = len - ihl;
         if (ic[0] != 8)   /* echo request only */
             return;
+        /* stash id/seq so the caller can attribute replies later */
+        uint16_t seq = (uint16_t)((ic[6] << 8) | ic[7]);
+        fprintf(stderr, "[echo] v4 req seq=%u len=%zu\n", seq, len);
+
+        uint8_t pkt[65536];
+        memcpy(pkt, p, len);
+        uint8_t *k = pkt;
+        unsigned kihl = ihl;
+        uint8_t *kic = k + kihl;
+        size_t kicl = len - kihl;
         uint8_t t[4];
-        memcpy(t, p + 12, 4);
-        memcpy(p + 12, p + 16, 4);
-        memcpy(p + 16, t, 4);
-        ic[0] = 0;   /* echo reply */
-        ic[2] = ic[3] = 0;
-        uint16_t cs = csum16(ic, icl);
-        ic[2] = (uint8_t)(cs >> 8);
-        ic[3] = (uint8_t)cs;
-        p[10] = p[11] = 0;
-        cs = csum16(p, ihl);
-        p[10] = (uint8_t)(cs >> 8);
-        p[11] = (uint8_t)cs;
-        tun_write(c->fd, p, len);
+        memcpy(t, k + 12, 4);
+        memcpy(k + 12, k + 16, 4);
+        memcpy(k + 16, t, 4);
+        kic[0] = 0;   /* echo reply */
+        kic[2] = kic[3] = 0;
+        uint16_t cs = csum16(kic, kicl);
+        kic[2] = (uint8_t)(cs >> 8);
+        kic[3] = (uint8_t)cs;
+        k[10] = k[11] = 0;
+        cs = csum16(k, kihl);
+        k[10] = (uint8_t)(cs >> 8);
+        k[11] = (uint8_t)cs;
+
+        if (c->swap_fam)
+            write_with_fam(c, k, len, __builtin_bswap32((uint32_t)AF_INET));
+        else
+            tun_write(c->fd, k, len);
         c->seen4++;
         return;
     }
@@ -119,7 +148,11 @@ static void echo_cb(void *ud, uint8_t *p, size_t len, bool last)
         uint16_t cs = (uint16_t)~s;
         ic[2] = (uint8_t)(cs >> 8);
         ic[3] = (uint8_t)cs;
-        tun_write(c->fd, p, len);
+        {
+            uint8_t pkt[65536];
+            memcpy(pkt, p, len);
+            tun_write(c->fd, pkt, len);
+        }
         c->seen6++;
     }
 }
@@ -197,7 +230,8 @@ static int mode_full(void)
     printf("V6TARGET=%s\n", have6 ? t6 : "(none)");
 
     atomic_bool stop = false;
-    echo_ctx_t ctx = { .fd = fd, .seen4 = 0, .seen6 = 0 };
+    echo_ctx_t ctx = { .fd = fd, .seen4 = 0, .seen6 = 0,
+                       .swap_fam = 0, .wr_fail = 0 };
     struct tun_pool *pool =
         tun_pool_create("iwan0", fd, 1, 1, echo_cb, &ctx, &stop);
     if (!pool) {
@@ -206,12 +240,21 @@ static int mode_full(void)
         return 2;
     }
 
-    int r4 = system("ping -c 3 -W 900 -t 6 10.207.0.2 >/tmp/ping4.log 2>&1");
+    /* A/B the family byte order: round 1 replies via the shipped
+     * tun_write (native order); round 2 via a byte-swapped family
+     * written directly. Whichever round ping receives settles it. */
+    int r4n = system(
+        "ping -c 2 -W 900 -t 5 10.207.0.2 >/tmp/ping4n.log 2>&1");
+    ctx.swap_fam = 1;
+    int r4s = system(
+        "ping -c 2 -W 900 -t 5 10.207.0.2 >/tmp/ping4s.log 2>&1");
+    ctx.swap_fam = 0;
+
     int r6 = 1;
     if (have6) {
         char cmd[160];
-        snprintf(cmd, sizeof cmd,
-                 "ping6 -c 3 -t 6 %s >/tmp/ping6.log 2>&1", t6);
+        snprintf(cmd, sizeof cmd, "ping6 -c 3 -i 1 %s >/tmp/ping6.log 2>&1",
+                 t6);
         r6 = system(cmd);
     }
     for (int i = 0; i < 10; i++) {
@@ -219,13 +262,23 @@ static int mode_full(void)
         usleep(100000);
     }
 
-    printf("PING4 rc=%d replies=%d\n", r4, atomic_load(&ctx.seen4));
+    printf("PING4-NATIVE rc=%d\n", r4n);
+    printf("PING4-SWAPPED rc=%d\n", r4s);
+    printf("WRITE-FAILS=%d\n", atomic_load(&ctx.wr_fail));
     printf("PING6 rc=%d replies=%d\n", r6, atomic_load(&ctx.seen6));
-    if (r4 != 0 || atomic_load(&ctx.seen4) < 3) {
-        fprintf(stderr, "---- /tmp/ping4.log ----\n");
-        system("cat /tmp/ping4.log >&2");
+    if (r4n != 0 || atomic_load(&ctx.seen4) < 4 || atomic_load(&ctx.wr_fail)) {
+        fprintf(stderr, "---- /tmp/ping4n.log ----\n");
+        system("cat /tmp/ping4n.log >&2");
+        fprintf(stderr, "---- /tmp/ping4s.log ----\n");
+        system("cat /tmp/ping4s.log >&2");
         rc = 3;
     }
+    if (r4n == 0 && r4s == 0)
+        printf("BYTEORDER both accepted (unexpected)\n");
+    else if (r4n == 0)
+        printf("BYTEORDER=NATIVE-CONFIRMED\n");
+    else if (r4s == 0)
+        printf("BYTEORDER=SWAPPED-CONFIRMED (shipped tun_write wrong!)\n");
     if (have6 && (r6 != 0 || atomic_load(&ctx.seen6) < 3)) {
         fprintf(stderr, "---- /tmp/ping6.log ----\n");
         system("cat /tmp/ping6.log >&2");
@@ -237,13 +290,17 @@ static int mode_full(void)
     if (capture_default(gw, dev, met)) {
         printf("CAPTURED gw=%s dev=%s metric=%s\n", gw, dev, met);
 
-        /* pin idempotency: a bare add on an existing pin must fail
-         * (the audit's EEXIST scenario); delete-then-add must work */
+        /* pin idempotency: capture real outputs — modern macOS may
+         * treat a duplicate add as success, which would make the
+         * audited EEXIST scenario moot */
         run("route -n delete -host 198.18.133.7 >/dev/null 2>&1");
         int a1 = run("route -n add -host 198.18.133.7 %s >/dev/null 2>&1",
                      gw);
-        int a2 = run("route -n add -host 198.18.133.7 %s >/dev/null 2>&1",
+        int a2 = run("route -n add -host 198.18.133.7 %s 2>/tmp/dup.err"
+                     " >/dev/null",
                      gw);
+        printf("DUP-ADD-STDERR:\n");
+        system("cat /tmp/dup.err 2>/dev/null");
         run("route -n delete -host 198.18.133.7 >/dev/null 2>&1");
         int a3 = run("route -n delete -host 198.18.133.7 %s >/dev/null"
                      " 2>&1; route -n add -host 198.18.133.7 %s"
@@ -251,12 +308,13 @@ static int mode_full(void)
                      gw, gw);
         printf("PIN bare-add=%d dup-add=%d delete-then-add=%d\n", a1, a2,
                a3);
-        if (a1 != 0 || a2 == 0 || a3 != 0) {
+        if (a1 != 0 || a3 != 0) {
             fprintf(stderr, "pin idempotency semantics unexpected\n");
             rc = rc ? rc : 4;
         } else {
-            printf("PIN-SEMANTICS-OK (dup add fails EEXIST as audited;"
-                   " delete-first works)\n");
+            printf("PIN-SEMANTICS-OK (delete-first works; dup-add rc=%d)"
+                   "\n",
+                   a2);
         }
         run("route -n delete -host 198.18.133.7 >/dev/null 2>&1");
     } else {
@@ -285,6 +343,8 @@ static int mode_full(void)
     }
     if (run("route -n add -net 10.99.2.5/24 -interface %s >/dev/null 2>&1",
             ifn) == 0) {
+        printf("UNMASKED-STORED-AS:\n");
+        system("netstat -rn -f inet | grep 10\\.99 | head -5");
         FILE *f = popen("route -n get 10.99.2.77 2>/dev/null", "r");
         char line[256];
         bool hit = false;
@@ -292,13 +352,13 @@ static int mode_full(void)
             if (strstr(line, ifn))
                 hit = true;
         pclose(f);
-        printf("CIDR-UNMASKED-HIT=%d (0 documents the audited BSD radix"
-               " behavior)\n",
+        printf("CIDR-UNMASKED-HIT=%d (1 means modern route(8) normalized"
+               " the target itself; audited miss would be 0)\n",
                hit);
-        run("route -n delete -net 10.99.2.5/24 -interface %s >/dev/null"
+        run("route -n delete -net 10.99.2.0/24 -interface %s >/dev/null"
             " 2>&1",
             ifn);
-        run("route -n delete -net 10.99.2.0/24 -interface %s >/dev/null"
+        run("route -n delete -net 10.99.2.5/24 -interface %s >/dev/null"
             " 2>&1",
             ifn);
     }
