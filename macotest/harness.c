@@ -276,9 +276,9 @@ static int mode_full(void)
     if (r4n == 0 && r4s == 0)
         printf("BYTEORDER both accepted (unexpected)\n");
     else if (r4n == 0)
-        printf("BYTEORDER=NATIVE-CONFIRMED\n");
+        printf("SHIPPED-WRITE-CONFIRMED (network-order family delivers)\n");
     else if (r4s == 0)
-        printf("BYTEORDER=SWAPPED-CONFIRMED (shipped tun_write wrong!)\n");
+        printf("SWAPPED-WRITE-CONFIRMED (shipped tun_write wrong!)\n");
     if (have6 && (r6 != 0 || atomic_load(&ctx.seen6) < 3)) {
         fprintf(stderr, "---- /tmp/ping6.log ----\n");
         system("cat /tmp/ping6.log >&2");
