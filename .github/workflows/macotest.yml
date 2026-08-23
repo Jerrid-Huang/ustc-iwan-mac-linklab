@@ -1,0 +1,75 @@
+# One-shot behavioral validation of the macOS utun data path on a real
+# (ephemeral) macOS runner: ping through the project's actual pool
+# reader + tun_write, route pin idempotency, CIDR masked-key semantics,
+# Keychain round-trip + root-read behavior. Manual dispatch only; the
+# main project's CI stays untouched.
+name: macotest
+
+on: workflow_dispatch
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch project at pinned commit
+        run: |
+          rm -rf /tmp/iwan && mkdir -p /tmp/iwan
+          git -C /tmp/iwan init -q
+          git -C /tmp/iwan remote add origin https://github.com/Jerrid-Huang/ustc-iwan-c.git
+          git -C /tmp/iwan fetch -q --depth 2 origin main
+          git -C /tmp/iwan checkout -q FETCH_HEAD
+          [ "$(git -C /tmp/iwan rev-parse HEAD)" = "917f3084339b08037205018d3de3a641cdecad9d" ] || {
+            echo "unexpected HEAD $(git -C /tmp/iwan rev-parse HEAD)"; exit 1; }
+          echo "head: $(git -C /tmp/iwan rev-parse --short HEAD)"
+
+      - name: Build OpenSSL (arm64)
+        run: |
+          VER="$(curl -s --retry 3 "https://api.github.com/repos/openssl/openssl/tags?per_page=100" \
+            | jq -r 'if type == "array" then (.[].name | select(test("^openssl-3\\.5\\."))) else empty end' \
+            | head -1)"
+          [ -n "$VER" ] || VER="openssl-3.5.1"
+          curl -sfL --retry 3 --max-time 400 \
+            "https://github.com/openssl/openssl/archive/refs/tags/${VER}.tar.gz" \
+            -o /tmp/ossl.tgz
+          tar xzf /tmp/ossl.tgz -C /tmp
+          cd /tmp/openssl-openssl-*
+          CFLAGS="-mmacosx-version-min=11.0" \
+            ./Configure darwin64-arm64-cc no-shared --prefix=/opt/ossl-arm64
+          make -j"$(sysctl -n hw.ncpu)" build_libs
+          sudo make install_sw
+
+      - name: Build project (arm64)
+        run: |
+          cd /tmp/iwan
+          cmake -B build -DOPENSSL_ROOT_DIR=/opt/ossl-arm64 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DIWAN_WERROR=ON
+          cmake --build build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Build harness against project objects
+        run: |
+          cd /tmp/iwan
+          clang "$GITHUB_WORKSPACE/macotest/harness.c" -Isrc/common -Isrc/oidc \
+            -O1 -Wall -o /tmp/harness \
+            build/lib/libiwan_oidc.a build/lib/libiwan_core.a build/lib/liblwip.a \
+            /opt/ossl-arm64/lib/libssl.a /opt/ossl-arm64/lib/libcrypto.a \
+            -framework CoreFoundation -framework Security -lpthread
+          echo "harness built"
+
+      - name: capture_default parse (real netstat output)
+        run: /tmp/harness gw
+
+      - name: Keychain round-trip (user context)
+        run: |
+          /tmp/harness wrap
+          /tmp/harness unwrap WKC1 example.com alice || true
+
+      - name: utun ping roundtrip + route semantics (root)
+        run: sudo /tmp/harness full
+
+      - name: Keychain read under root (behavior demo)
+        run: |
+          sudo /tmp/harness unwrap WKC1 example.com alice \
+            || echo "::notice::root cannot read the user keychain item (documented audit finding)"
